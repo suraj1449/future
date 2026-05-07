@@ -21,20 +21,17 @@ Fixes:
 
 from flask import Flask, jsonify, render_template_string, Response, request
 from kiteconnect import KiteConnect
-import datetime, threading, time, logging, queue, requests
-from zoneinfo import ZoneInfo
-import threading as _threading
-import os
+import datetime, threading, time, logging, queue, os
 
 # ── Credentials ──────────────────────────────────────────────────────────────
-API_KEY      = os.getenv("KITE_API_KEY", "")
-ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "")
-FETCH_DELAY_SECONDS = 5   # seconds after candle close before fetching
+API_KEY      = "oxc7tfxwa3n5zvqq"
+ACCESS_TOKEN = "1ooQc9pWAUB3vqDgkFJ8Meb7ENedxQHH"
+FETCH_DELAY_SECONDS = 7   # seconds after candle close before fetching
 # ─────────────────────────────────────────────────────────────────────────────
 
 app  = Flask(__name__)
-kite = None
-MARKET_TZ = ZoneInfo("Asia/Kolkata")
+kite = KiteConnect(api_key=API_KEY)
+kite.set_access_token(ACCESS_TOKEN)
 
 INTERVALS = {
     "1min":  {"kite": "minute",   "minutes": 1},
@@ -53,44 +50,6 @@ _subscribers      = {k: [] for k in INTERVALS}
 _subscribers_lock = threading.Lock()
 
 
-def _has_credentials(api_key, access_token):
-    return bool((api_key or "").strip()) and bool((access_token or "").strip())
-
-
-def _build_kite_client(api_key=None, access_token=None):
-    api_key = API_KEY if api_key is None else api_key
-    access_token = ACCESS_TOKEN if access_token is None else access_token
-    if not _has_credentials(api_key, access_token):
-        return None
-    client = KiteConnect(api_key=api_key)
-    client.set_access_token(access_token)
-    return client
-
-
-def set_kite_credentials(api_key, access_token):
-    global API_KEY, ACCESS_TOKEN, kite
-    API_KEY = api_key
-    ACCESS_TOKEN = access_token
-    kite = _build_kite_client(api_key, access_token)
-
-
-def ensure_kite():
-    global kite
-    if kite is None:
-        kite = _build_kite_client()
-    if kite is None:
-        raise RuntimeError("Set API_KEY and ACCESS_TOKEN before running future.py")
-    return kite
-
-
-def market_now():
-    return datetime.datetime.now(MARKET_TZ).replace(tzinfo=None)
-
-
-def market_today():
-    return market_now().date()
-
-
 def _notify(interval_key, ts_str):
     with _subscribers_lock:
         dead = []
@@ -102,23 +61,22 @@ def _notify(interval_key, ts_str):
 
 
 def _next_fire(minutes):
-    now      = market_now()
+    now      = datetime.datetime.now()
     now_s    = now.hour * 3600 + now.minute * 60 + now.second
     anchor   = 9 * 3600 + 15 * 60
     step     = minutes * 60
-    market_close = 15 * 3600 + 30 * 60
-
     if now_s <= anchor:
         fire_s = anchor + step + FETCH_DELAY_SECONDS
     else:
-        done   = (now_s - anchor - FETCH_DELAY_SECONDS) // step
+        done   = (now_s - anchor) // step
         fire_s = anchor + (done + 1) * step + FETCH_DELAY_SECONDS
-
+        if fire_s <= now_s:
+            fire_s += step
     fh, rem  = divmod(int(fire_s), 3600)
     fm, fs   = divmod(rem, 60)
     fire_dt  = now.replace(hour=fh % 24, minute=fm, second=fs, microsecond=0)
-    if fire_dt <= now:
-        fire_dt += datetime.timedelta(seconds=step)
+    if fire_dt < now:
+        fire_dt += datetime.timedelta(days=1)
     return fire_dt
 
 
@@ -126,18 +84,13 @@ def _refresh_loop(key):
     minutes = INTERVALS[key]["minutes"]
     while True:
         fire_at   = _next_fire(minutes)
-        sleep_sec = (fire_at - market_now()).total_seconds()
+        sleep_sec = (fire_at - datetime.datetime.now()).total_seconds()
         logging.info("[%s] next fetch at %s (%.1fs)", key, fire_at.strftime("%H:%M:%S"), sleep_sec)
         if sleep_sec > 0:
             time.sleep(sleep_sec)
-        # Skip fetch outside market hours
-        now = market_now()
-        now_s = now.hour * 3600 + now.minute * 60 + now.second
-        if now_s < 9 * 3600 + 15 * 60 or now_s > 15 * 3600 + 35 * 60:
-            continue
         try:
-            candles = _fetch_raw(key, market_today())
-            now     = market_now()
+            candles = _fetch_raw(key, datetime.date.today())
+            now     = datetime.datetime.now()
             with _cache_lock:
                 _raw_cache[key] = candles
                 _cache_ts[key]  = now
@@ -146,12 +99,10 @@ def _refresh_loop(key):
             _notify(key, ts)
         except Exception as e:
             logging.warning("[%s] fetch error: %s", key, e)
-            time.sleep(10)  # wait before retrying on error
 
 
 def _get_token(date):
-    client = ensure_kite()
-    instruments = client.instruments("NFO")
+    instruments = kite.instruments("NFO")
     futs = [i for i in instruments
             if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"
             and i["expiry"] >= date]
@@ -168,15 +119,19 @@ def classify(pc, oc):
 
 
 def _fetch_raw(key, date):
-    client = ensure_kite()
     token = _get_token(date)
     if not token:
         return []
-    today = market_today()
+    today = datetime.date.today()
     from_dt = datetime.datetime.combine(date, datetime.time(9, 15))
-    to_dt   = market_now() if date == today else \
-              datetime.datetime.combine(date, datetime.time(15, 30))
-    candles = client.historical_data(token, from_dt, to_dt, INTERVALS[key]["kite"], oi=True)
+    if date == today:
+        to_dt = datetime.datetime.now()
+        # Guard: if running before market open, to_dt < from_dt → return empty
+        if to_dt < from_dt:
+            return []
+    else:
+        to_dt = datetime.datetime.combine(date, datetime.time(15, 30))
+    candles = kite.historical_data(token, from_dt, to_dt, INTERVALS[key]["kite"], oi=True)
     if date == today and len(candles) > 1:
         candles = candles[:-1]
     return candles
@@ -219,43 +174,40 @@ def index():
 
 @app.route("/api/data/<iv>")
 def api_data(iv):
+    if iv not in INTERVALS:
+        return jsonify({"error": "bad interval"}), 400
+    mode = request.args.get("mode", "close")
+    if mode not in ("close", "open"): mode = "close"
+
+    ds    = request.args.get("date", "")
+    today = datetime.date.today()
     try:
-        if iv not in INTERVALS:
-            return jsonify({"error": "bad interval"}), 400
-        mode = request.args.get("mode", "close")
-        if mode not in ("close", "open"): mode = "close"
+        req_date = datetime.date.fromisoformat(ds) if ds else today
+    except ValueError:
+        req_date = today
+    is_today = req_date == today
 
-        ds    = request.args.get("date", "")
-        today = market_today()
-        try:
-            req_date = datetime.date.fromisoformat(ds) if ds else today
-        except ValueError:
-            req_date = today
-        is_today = req_date == today
-
-        if is_today:
+    if is_today:
+        with _cache_lock:
+            candles, ts = _raw_cache[iv], _cache_ts[iv]
+        if not candles:
+            candles = _fetch_raw(iv, today)
+            now = datetime.datetime.now()
             with _cache_lock:
-                candles, ts = _raw_cache[iv], _cache_ts[iv]
-            if not candles:
-                candles = _fetch_raw(iv, today)
-                now = market_now()
-                with _cache_lock:
-                    _raw_cache[iv] = candles
-                    _cache_ts[iv]  = now
-                ts = now
-        else:
-            candles = _fetch_raw(iv, req_date)
-            ts = None
+                _raw_cache[iv] = candles
+                _cache_ts[iv]  = now
+            ts = now
+    else:
+        candles = _fetch_raw(iv, req_date)
+        ts = None
 
-        rows = build_rows(candles, mode)
-        return jsonify({
-            "rows":      rows,
-            "cached_at": ts.strftime("%H:%M:%S") if ts else req_date.isoformat(),
-            "row_count": len(rows),
-            "is_today":  is_today,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    rows = build_rows(candles, mode)
+    return jsonify({
+        "rows":      rows,
+        "cached_at": ts.strftime("%H:%M:%S") if ts else req_date.isoformat(),
+        "row_count": len(rows),
+        "is_today":  is_today,
+    })
 
 
 @app.route("/api/stream/<iv>")
@@ -591,7 +543,8 @@ tr:hover td{background:var(--row-hover)}
       (isToday(currentDate) ? ' today' : ' ' + fmtDate(currentDate)) + '&hellip;</div>';
 
     var url = '/api/data/' + iv + '?mode=' + currentMode + '&date=' + currentDate;
-    fetchJson(url)
+    fetch(url)
+      .then(function (r) { return r.json(); })
       .then(function (json) {
         if (json.error) throw new Error(json.error);
         var rows = json.rows || [];
@@ -622,7 +575,8 @@ tr:hover td{background:var(--row-hover)}
       bustToday(iv);
       // Pre-fetch both modes silently for this interval
       ['close', 'open'].forEach(function (m) {
-        fetchJson('/api/data/' + iv + '?mode=' + m + '&date=' + currentDate)
+        fetch('/api/data/' + iv + '?mode=' + m + '&date=' + currentDate)
+          .then(function (r) { return r.json(); })
           .then(function (json) {
             if (json.error) return;
             cache[ck(iv, currentDate, m)] = { rows: json.rows || [], cached_at: json.cached_at };
@@ -646,21 +600,6 @@ tr:hover td{background:var(--row-hover)}
       delete sseMap[iv];
       setTimeout(function () { connectOne(iv); }, 5000);
     };
-  }
-
-  function fetchJson(url) {
-    return fetch(url).then(function (r) {
-      return r.text().then(function (text) {
-        try {
-          return JSON.parse(text);
-        } catch (err) {
-          if (!r.ok) {
-            throw new Error('HTTP ' + r.status + ' from ' + url);
-          }
-          throw new Error('Server returned non-JSON response for ' + url);
-        }
-      });
-    });
   }
 
   function connectAllSSE() {
@@ -782,13 +721,6 @@ tr:hover td{background:var(--row-hover)}
   applyDateMode();
   fetchData('1min');
   connectAllSSE();   // opens all 4 SSE streams simultaneously
-  
-  // Fallback polling — if SSE dies on Render, still refresh every 60s
-  setInterval(function () {
-      if (!isToday(currentDate)) return;
-      bustToday(currentTab);
-      doFetch(currentTab);
-  }, 60000);
 
 }());
 </script>
@@ -798,64 +730,35 @@ tr:hover td{background:var(--row-hover)}
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-@app.route("/healthz")
-def healthz():
-    return {"ok": True}
-
-def _keep_alive():
-    import requests, time
-    url = os.getenv("RENDER_EXTERNAL_URL", "")
-    if not url:
-        return
-    while True:
-        time.sleep(600)
-        try:
-            requests.get(url + "/healthz", timeout=10)
-        except Exception:
-            pass
-
-def _startup_future():
-    try:
-        ensure_kite()
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
-
-        # Warm up today's cache — exact same logic as before
-        today = market_today()
-        for k in INTERVALS:
-            try:
-                candles = _fetch_raw(k, today)
-                now = market_now()
-                with _cache_lock:
-                    _raw_cache[k] = candles
-                    _cache_ts[k]  = now
-                print("  ok {:6s}  {} candles".format(k, len(candles)))
-            except Exception as e:
-                print("  !! {:6s}  {}".format(k, e))
-
-        # Start refresh loops — exact same logic as before
-        for k in INTERVALS:
-            _threading.Thread(
-                target=_refresh_loop,
-                args=(k,),
-                daemon=True,
-                name="refresh-"+k
-            ).start()
-            fire_at   = _next_fire(INTERVALS[k]["minutes"])
-            sleep_sec = (fire_at - market_now()).total_seconds()
-            print("  {:<8}  {:>12}  {:>9.1f}s".format(
-                k, fire_at.strftime("%H:%M:%S"), sleep_sec))
-
-        # Keep alive thread
-        _threading.Thread(target=_keep_alive, daemon=True).start()
-
-    except Exception as e:
-        print("Startup error:", e)
-
-with app.app_context():
-    _startup_future()
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5001"))
-    print("\n  http://localhost:" + str(port))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+
     print("=" * 55)
-    app.run(debug=False, port=port, host="0.0.0.0", threaded=True)
+    print("  Nifty Futures OI Dashboard")
+    print("  Warming up today's cache...")
+    today = datetime.date.today()
+    for k in INTERVALS:
+        try:
+            candles = _fetch_raw(k, today)
+            now = datetime.datetime.now()
+            with _cache_lock:
+                _raw_cache[k] = candles
+                _cache_ts[k]  = now
+            print("  ok {:6s}  {} candles".format(k, len(candles)))
+        except Exception as e:
+            print("  !! {:6s}  {}".format(k, e))
+
+    print("\n  {:<8}  {:>12}  {:>10}".format("INTERVAL", "NEXT FETCH", "SLEEP"))
+    print("  {}  {}  {}".format("-"*8, "-"*12, "-"*10))
+    for k in INTERVALS:
+        t = threading.Thread(target=_refresh_loop, args=(k,), daemon=True, name="refresh-"+k)
+        t.start()
+        fire_at   = _next_fire(INTERVALS[k]["minutes"])
+        sleep_sec = (fire_at - datetime.datetime.now()).total_seconds()
+        print("  {:<8}  {:>12}  {:>9.1f}s".format(k, fire_at.strftime("%H:%M:%S"), sleep_sec))
+
+    port = int(os.environ.get("PORT", "5001"))
+
+    print("\n  http://localhost:{}".format(port))
+    print("=" * 55)
+    app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
