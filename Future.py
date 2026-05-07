@@ -21,7 +21,7 @@ Fixes:
 
 from flask import Flask, jsonify, render_template_string, Response, request
 from kiteconnect import KiteConnect
-import datetime, threading, time, logging, queue
+import datetime, threading, time, logging, queue, requests
 from zoneinfo import ZoneInfo
 import threading as _threading
 import os
@@ -79,7 +79,7 @@ def ensure_kite():
     if kite is None:
         kite = _build_kite_client()
     if kite is None:
-        raise RuntimeError("Set API_KEY and ACCESS_TOKEN before running FUTURE_BIAS.py")
+        raise RuntimeError("Set API_KEY and ACCESS_TOKEN before running future.py")
     return kite
 
 
