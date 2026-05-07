@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: future-bias
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python FUTURE_BIAS.py
+    envVars:
+      - key: TZ
+        value: Asia/Kolkata
