@@ -29,7 +29,7 @@ import os
 # ── Credentials ──────────────────────────────────────────────────────────────
 API_KEY      = os.getenv("KITE_API_KEY", "")
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "")
-FETCH_DELAY_SECONDS = 10   # seconds after candle close before fetching
+FETCH_DELAY_SECONDS = 5   # seconds after candle close before fetching
 # ─────────────────────────────────────────────────────────────────────────────
 
 app  = Flask(__name__)
@@ -106,18 +106,19 @@ def _next_fire(minutes):
     now_s    = now.hour * 3600 + now.minute * 60 + now.second
     anchor   = 9 * 3600 + 15 * 60
     step     = minutes * 60
+    market_close = 15 * 3600 + 30 * 60
+
     if now_s <= anchor:
         fire_s = anchor + step + FETCH_DELAY_SECONDS
     else:
-        done   = (now_s - anchor) // step
+        done   = (now_s - anchor - FETCH_DELAY_SECONDS) // step
         fire_s = anchor + (done + 1) * step + FETCH_DELAY_SECONDS
-        if fire_s <= now_s:
-            fire_s += step
+
     fh, rem  = divmod(int(fire_s), 3600)
     fm, fs   = divmod(rem, 60)
     fire_dt  = now.replace(hour=fh % 24, minute=fm, second=fs, microsecond=0)
-    if fire_dt < now:
-        fire_dt += datetime.timedelta(days=1)
+    if fire_dt <= now:
+        fire_dt += datetime.timedelta(seconds=step)
     return fire_dt
 
 
@@ -129,6 +130,11 @@ def _refresh_loop(key):
         logging.info("[%s] next fetch at %s (%.1fs)", key, fire_at.strftime("%H:%M:%S"), sleep_sec)
         if sleep_sec > 0:
             time.sleep(sleep_sec)
+        # Skip fetch outside market hours
+        now = market_now()
+        now_s = now.hour * 3600 + now.minute * 60 + now.second
+        if now_s < 9 * 3600 + 15 * 60 or now_s > 15 * 3600 + 35 * 60:
+            continue
         try:
             candles = _fetch_raw(key, market_today())
             now     = market_now()
@@ -140,6 +146,7 @@ def _refresh_loop(key):
             _notify(key, ts)
         except Exception as e:
             logging.warning("[%s] fetch error: %s", key, e)
+            time.sleep(10)  # wait before retrying on error
 
 
 def _get_token(date):
