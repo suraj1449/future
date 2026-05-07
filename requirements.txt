@@ -1,5 +1,2 @@
-flask
-kiteconnect
-requests
-gunicorn
-gevent
+Flask>=3.0,<4
+kiteconnect>=5.0,<6
