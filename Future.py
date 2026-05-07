@@ -775,6 +775,13 @@ tr:hover td{background:var(--row-hover)}
   applyDateMode();
   fetchData('1min');
   connectAllSSE();   // opens all 4 SSE streams simultaneously
+  
+  // Fallback polling — if SSE dies on Render, still refresh every 60s
+  setInterval(function () {
+      if (!isToday(currentDate)) return;
+      bustToday(currentTab);
+      doFetch(currentTab);
+  }, 60000);
 
 }());
 </script>
